@@ -656,25 +656,23 @@ async function fetchOne(id){
     if(p.state!=='playing'){p.gameSince=null;p.afk=false;}
 
     // ── AFK detection ──
-    // Method 1: Steam's own away state (personastate 3/4) = Steam detected user idle
-    const steamSaysAway = summary.personastate===3||summary.personastate===4;
-    // Method 2: online (not playing) but no state change for >15 min = probably idle
-    if(p.state==='away'&&!p.afk){
+    // Единственный надёжный источник: Steam сам ставит personastate=3/4
+    // когда пользователь не двигает мышь/клавиши НА РАБОЧЕМ СТОЛЕ ~10 мин.
+    // Но если человек играет — Steam часто не ставит away.
+    // Поэтому АФК только когда: state=away (не играет) + Steam сам это сказал.
+    // Никогда не ставим АФК во время игры по таймеру — это всегда ложное срабатывание.
+    const steamAway = summary.personastate===3||summary.personastate===4;
+    if(p.state==='away'&&steamAway&&!p.afk){
+      // Человек не в игре, Steam сам детектил неактивность
       p.afk=true;
-      if(sc){addLog(p,'ev-afk','🌙 Отошёл (Steam зафиксировал неактивность)');SFX.afk();notify('afk',p.name,'Отошёл — неактивен в Steam');}
+      addLog(p,'ev-afk','💤 АФК — Steam зафиксировал неактивность');
+      SFX.afk();notify('afk',p.name,'Неактивен в Steam');
     }
-    // Method 3: same game, no changes for >20 min = likely AFK in game
-    if(p.state==='playing'&&p.gameSince){
-      const inMs=now()-p.gameSince;
-      if(inMs>20*60*1000&&!sc&&!gc&&!p.afk){
-        p.afk=true;
-        addLog(p,'ev-afk',`💤 Возможно АФК в «${p.game}» — без изменений ${fmtMs(inMs)}`);
-        SFX.afk();notify('afk',p.name,`Без изменений ${fmtMs(inMs)} в ${p.game}`);
-      }
-    }
-    // Reset AFK if state/game changed
-    if((sc||gc)&&p.state!=='away')p.afk=false;
-    if(p.state==='offline')p.afk=false;
+    // Сброс АФК: любое изменение статуса или запуск игры
+    if(sc||gc){p.afk=false;}
+    if(p.state==='playing'){p.afk=false;} // в игре — никогда не АФК
+    if(p.state==='offline'){p.afk=false;}
+    if(p.state==='online'&&!steamAway){p.afk=false;} // вернулся за ПК
 
     // ── State-change events ──
     if(sc){
