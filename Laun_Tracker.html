@@ -881,10 +881,11 @@ function loadProfiles(){
     if(DB.size>0){
       updateGlobal();renderSidebar();
       // start polling all loaded profiles
-      DB.forEach((_,id)=>{
-        const p=DB.get(id);
-        p.timer=setTimeout(()=>fetchOne(id),Math.random()*3000); // stagger
-      });
+      // Resolve unresolved IDs, then start batch poller
+      const _toRes=[];
+      DB.forEach((_,id)=>{ if(!DB.get(id).steamId) _toRes.push(id); });
+      Promise.all(_toRes.map(id=>fetchOne(id))).then(()=>startBatchPoller());
+      if(!_toRes.length) setTimeout(startBatchPoller, 200);
       // select first
       selId=DB.keys().next().value;
       setTimeout(()=>{selectProfile(selId);},100);
@@ -951,131 +952,26 @@ function notify(type,name,msg){
 
 // ── Fetch one profile ──────────────────────────────────────────────────────
 async function fetchOne(id){
-  const p=DB.get(id);if(!p||p.busy)return;
-  if(!apiKey()){p.error='Введи API ключ вверху';done(p,id);return;}
-  p.busy=true;renderSidebar();
-
-  try{
-    // Resolve ID on first fetch
-    if(!p.steamId){
+  // fetchOne now only resolves the steamId if unknown
+  // actual data fetching is handled by batchPoll()
+  const p=DB.get(id); if(!p) return;
+  if(!apiKey()){ p.error='API ключ не задан'; renderSidebar(); return; }
+  if(!p.steamId){
+    p.busy=true; renderSidebar();
+    try{
       p.steamId=await resolveSteamId(p.inputUrl);
-      // update profile URL to canonical
       p.url=`https://steamcommunity.com/profiles/${p.steamId}`;
       saveProfiles();
+      p.error=null;
+    }catch(e){
+      p.error=e.message;
+      addLog(p,'ev-err','⚠ '+e.message);
     }
-
-    // Get summary + recent games in parallel
-    const[summary,recentGames,banStatus]=await Promise.all([
-      getSummary(p.steamId),
-      getRecentGames(p.steamId),
-      getBanStatus(p.steamId),
-    ]);
-
-    p.error=null;
-
-    // ── Extract data ──
-    const prevState=p.state, prevGame=p.game;
-    p.name=summary.personaname||p.name;
-    p.avatar=summary.avatarfull||summary.avatarmedium||summary.avatar||'';
-    p.profileUrl=summary.profileurl||p.url;
-    p.country=summary.loccountrycode||'';
-    p.game=summary.gameextrainfo||null;
-    p.gameId=summary.gameid||null;
-    p.bans=banStatus;
-    // Steam sometimes exposes the game server IP directly
-    p.steamServerIp=summary.gameserverip&&summary.gameserverip!=='0.0.0.0:0'?summary.gameserverip:null;
-    p.state=classifyPlayer(summary);
-    p.games=recentGames;
-    p.visibility=summary.communityvisibilitystate; // 1=private,3=public
-    saveProfiles(); // update cached name/avatar
-
-    const sc=prevState!==p.state, gc=prevGame!==p.game;
-
-    // ── Timers ──
-    if(p.state!=='offline'&&!p.onlineSince)p.onlineSince=now();
-    if(p.state==='offline'){p.onlineSince=null;p.afk=false;}
-    if(p.state==='playing'&&(!p.gameSince||gc))p.gameSince=now();
-    if(p.state!=='playing'){p.gameSince=null;p.afk=false;}
-
-    // ── AFK detection ──
-    // Единственный надёжный источник: Steam сам ставит personastate=3/4
-    // когда пользователь не двигает мышь/клавиши НА РАБОЧЕМ СТОЛЕ ~10 мин.
-    // Но если человек играет — Steam часто не ставит away.
-    // Поэтому АФК только когда: state=away (не играет) + Steam сам это сказал.
-    // Никогда не ставим АФК во время игры по таймеру — это всегда ложное срабатывание.
-    const steamAway = summary.personastate===3||summary.personastate===4;
-    if(p.state==='away'&&steamAway&&!p.afk){
-      // Человек не в игре, Steam сам детектил неактивность
-      p.afk=true;
-      addLog(p,'ev-afk','💤 АФК — Steam зафиксировал неактивность');
-      SFX.afk();notify('afk',p.name,'Неактивен в Steam');
-    }
-    // Сброс АФК: любое изменение статуса или запуск игры
-    if(sc||gc){p.afk=false;}
-    if(p.state==='playing'){p.afk=false;} // в игре — никогда не АФК
-    if(p.state==='offline'){p.afk=false;}
-    if(p.state==='online'&&!steamAway){p.afk=false;} // вернулся за ПК
-
-    // ── State-change events — only fire if we had a REAL previous state ──
-    // p.lastFetch===null means first load, skip notifications to avoid false alarms
-    const isFirstLoad = !p.lastFetch;
-    if(sc && !isFirstLoad){
-      if(p.state==='playing'){
-        addLog(p,'ev-gm',`▶ Запустил: ${p.game||'?'}`);
-        SFX.playing();notify('playing',p.name,`▶ ${p.game||'?'}`);
-      }else if(p.state==='online'){
-        addLog(p,'ev-on','🟢 Вышел в сеть');
-        SFX.online();notify('online',p.name,'Вышел в сеть');
-      }else if(p.state==='offline'){
-        addLog(p,'ev-off','⚫ Ушёл в оффлайн');
-        SFX.offline();notify('offline',p.name,'Ушёл в оффлайн');
-      }else if(p.state==='away'){
-        addLog(p,'ev-afk','🌙 Отошёл');
-      }
-      p.lastChange=now();
-    }else if(sc && isFirstLoad){
-      // First load — just log silently, no sound/notification
-      addLog(p,'ev-inf',`📍 Статус при загрузке: ${stOf(p).label}${p.game?' · '+p.game:''}`);
-    }
-    // Game changed while still playing (not first load)
-    if(gc&&p.game&&!sc&&!isFirstLoad){
-      addLog(p,'ev-gm',`🔄 Сменил игру → ${p.game}`);
-      SFX.playing();notify('playing',p.name,`Сменил → ${p.game}`);
-      p.lastChange=now();
-    }
-    // Game closed while staying online (not first load)
-    if(gc&&!p.game&&prevGame&&!sc&&!isFirstLoad){
-      addLog(p,'ev-gm',`⏹ Вышел из «${prevGame}»`);
-      p.lastChange=now();
-    }
-
-    // ── Rust server ──
-    if(p.state==='playing'&&p.game&&/rust/i.test(p.game)){
-      // Always try to get server: by IP first, then by player
-      const rs=await findRustServer(p.steamId||'', p.name, p.steamServerIp||null);
-      if(rs){
-        if(rs.name!==p.rust?.name){
-          p.rust=rs;
-          addLog(p,'ev-rs',`🏠 Сервер: ${rs.name}`);
-          SFX.rust();notify('ev-rs',p.name,rs.name);
-        }
-      }else if(p.steamServerIp&&(!p.rust||!p.rust.name)){
-        // BM didn't find it but we have the IP — store minimal info
-        const parts=p.steamServerIp.split(':');
-        p.rust={name:null,ip:parts[0],port:parts[1],players:null,max:null,country:null,rank:null,map:null,wipe:null,bmId:null};
-        // Try to resolve name from BM one more time async
-        findRustByIp(p.steamServerIp).then(rs2=>{
-          if(rs2&&DB.get(p.id)){DB.get(p.id).rust=rs2;if(selId===p.id)renderTab('rust');}
-        });
-      }
-    }else{if(p.state!=='playing')p.rust=null;}
-
-  }catch(e){
-    p.error=e.message;
-    addLog(p,'ev-err',`⚠ Ошибка: ${e.message}`);
+    p.busy=false; renderSidebar();
   }
-
-  p.busy=false;done(p,id);
+  // Trigger immediate batch poll for all
+  if(_globalTimer) clearTimeout(_globalTimer);
+  _globalTimer = setTimeout(batchPoll, 100);
 }
 
 function done(p,id){
@@ -1089,6 +985,117 @@ function done(p,id){
   renderSidebar();
   if(id===selId)renderDetail(id);
 }
+
+// ── GLOBAL BATCH POLLER ────────────────────────────────────────────────────
+// Fetches ALL profiles in one request instead of N separate ones
+// Steam GetPlayerSummaries accepts up to 100 steamids comma-separated
+let _globalTimer = null;
+let _batchRunning = false;
+
+async function batchPoll() {
+  if (_batchRunning) return;
+  const profiles = [];
+  DB.forEach((p, id) => { if (p.steamId) profiles.push({p, id}); });
+  if (!profiles.length) { scheduleNext(); return; }
+
+  _batchRunning = true;
+
+  try {
+    // Single request for ALL summaries
+    const ids = profiles.map(x => x.p.steamId).join(',');
+    const url = `${STEAM}/ISteamUser/GetPlayerSummaries/v2/?key=${apiKey()}&steamids=${ids}&_t=${Date.now()}`;
+    const data = await proxyGet(url);
+    const summaryMap = {};
+    if (data?.response?.players) {
+      data.response.players.forEach(p => { summaryMap[p.steamid] = p; });
+    }
+
+    // Process each profile with its summary
+    for (const {p, id} of profiles) {
+      const summary = summaryMap[p.steamId];
+      if (!summary) continue;
+
+      const prevState = p.state, prevGame = p.game;
+      p.error = null;
+      p.name = summary.personaname || p.name;
+      p.avatar = summary.avatarfull || summary.avatarmedium || p.avatar;
+      p.profileUrl = summary.profileurl || p.url;
+      p.country = summary.loccountrycode || p.country;
+      p.game = summary.gameextrainfo || null;
+      p.gameId = summary.gameid || null;
+      p.steamServerIp = summary.gameserverip && summary.gameserverip !== '0.0.0.0:0'
+        ? summary.gameserverip : null;
+      p.state = classifyPlayer(summary);
+
+      const sc = prevState !== p.state, gc = prevGame !== p.game;
+      const isFirstLoad = !p.lastFetch;
+
+      // Timers
+      if (p.state !== 'offline' && !p.onlineSince) p.onlineSince = now();
+      if (p.state === 'offline') { p.onlineSince = null; p.afk = false; }
+      if (p.state === 'playing' && (!p.gameSince || gc)) p.gameSince = now();
+      if (p.state !== 'playing') { p.gameSince = null; p.afk = false; }
+
+      // AFK
+      if (p.state === 'playing' && p.gameSince) {
+        const inMs = now() - p.gameSince;
+        if (inMs > 20*60*1000 && !sc && !gc && !p.afk) {
+          p.afk = true;
+          addLog(p,'ev-afk',`💤 Возможно АФК в «${p.game}»`);
+          SFX.afk(); notify('afk', p.name, `АФК в ${p.game}`);
+        }
+        if (sc || gc) p.afk = false;
+      }
+
+      // Events
+      if (sc && !isFirstLoad) {
+        if (p.state === 'playing') { addLog(p,'ev-gm',`▶ ${p.game||'?'}`); SFX.playing(); notify('playing',p.name,`▶ ${p.game||'?'}`); }
+        else if (p.state === 'online') { addLog(p,'ev-on','🟢 В сети'); SFX.online(); notify('online',p.name,'Вышел в сеть'); }
+        else if (p.state === 'offline') { addLog(p,'ev-off','⚫ Оффлайн'); SFX.offline(); notify('offline',p.name,'Ушёл в оффлайн'); }
+        else if (p.state === 'away') addLog(p,'ev-afk','🌙 Отошёл');
+        p.lastChange = now();
+      } else if (sc && isFirstLoad) {
+        addLog(p,'ev-inf',`📍 ${stOf(p).label}${p.game?' · '+p.game:''}`);
+      }
+      if (gc && p.game && !sc && !isFirstLoad) {
+        addLog(p,'ev-gm',`🔄 ${p.game}`); SFX.playing(); notify('playing',p.name,`Сменил → ${p.game}`);
+        p.lastChange = now();
+      }
+
+      // Rust server (only for currently playing in rust)
+      if (p.state === 'playing' && p.game && /rust/i.test(p.game) && p.steamServerIp && !p.rust?.name) {
+        findRustByIp(p.steamServerIp).then(rs => {
+          if (rs && DB.get(id)) { DB.get(id).rust = rs; if (selId===id) renderDetail(id); }
+        });
+      } else if (p.state !== 'playing') { p.rust = null; }
+
+      p.lastFetch = now();
+      p.nextFetch = new Date(now().getTime() + 30000);
+      p.busy = false;
+    }
+
+    saveProfiles();
+  } catch(e) {
+    // If batch fails, mark all as error
+    DB.forEach(p => { if (!p.lastFetch) p.error = e.message; });
+  }
+
+  _batchRunning = false;
+  renderSidebar();
+  if (selId != null) renderDetail(selId);
+  scheduleNext();
+}
+
+function scheduleNext() {
+  if (_globalTimer) clearTimeout(_globalTimer);
+  _globalTimer = setTimeout(batchPoll, 30000);
+}
+
+function startBatchPoller() {
+  if (_globalTimer) clearTimeout(_globalTimer);
+  batchPoll(); // immediate first run
+}
+
 
 function addLog(p,type,text){
   p.log.unshift({type,text,ts:clock()});
@@ -1110,7 +1117,8 @@ function addProfile(){
     afk:false,rust:null,bans:null,lastFetch:null,nextFetch:null,timer:null,
   });
   $('addUrl').value='';
-  renderSidebar();selectProfile(id);fetchOne(id);updateGlobal();saveProfiles();
+  renderSidebar();selectProfile(id);updateGlobal();saveProfiles();
+  fetchOne(id).then(()=>{ if(_globalTimer)clearTimeout(_globalTimer); startBatchPoller(); });
 }
 
 function removeProfile(id){
